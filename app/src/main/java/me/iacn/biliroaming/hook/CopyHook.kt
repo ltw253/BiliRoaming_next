@@ -32,6 +32,10 @@ class CopyHook(classLoader: ClassLoader) : BaseHook(classLoader) {
 
     private val enhanceLongClickCopy = sPrefs.getBoolean("comment_copy_enhance", false)
 
+    // 已装过长按监听的 RichTextView（弱引用），用于只记录"首次覆盖 App 监听"的诊断
+    private val longClickViews =
+        java.util.Collections.newSetFromMap(java.util.WeakHashMap<View, Boolean>())
+
     override fun startHook() {
         if (!sPrefs.getBoolean("comment_copy", false)) return
 
@@ -66,8 +70,15 @@ class CopyHook(classLoader: ClassLoader) : BaseHook(classLoader) {
                     listOf("T", "setOriginText", "setExpandedDesc", "setRetractedDesc").forEach { name ->
                         clazz.hookAfterAllMethods(name) { param ->
                             val view = param.thisObject as? View ?: return@hookAfterAllMethods
-                            val text = extractDescText(param.args.getOrNull(0))
-                            if (text != null) descFullText[view] = text.toString()
+                            val text = extractDescText(param.args.getOrNull(0))?.toString()
+                            if (text != null) {
+                                // 展开态/收起态的 setter 调用顺序不固定，后写入的可能反而是
+                                // 更短的收起态文本。这里只保留最长的一份，保证"复制全部"拿到全文。
+                                val old = descFullText[view]
+                                if (old == null || text.length > old.length) {
+                                    descFullText[view] = text
+                                }
+                            }
                         }
                     }
                     val longClickHooker: Hooker = hooker@{ param ->
@@ -168,7 +179,13 @@ class CopyHook(classLoader: ClassLoader) : BaseHook(classLoader) {
                     CharSequence::class.java,
                     TextView.BufferType::class.java
                 ) { param ->
-                    (param.thisObject as? View)?.setOnLongClickListener { v ->
+                    val view = param.thisObject as? View ?: return@hookAfterMethod
+                    // M6 诊断：首次安装监听时，若 App 已自行注册长按监听，说明模块会覆盖它。
+                    // 之后的 setText 中该监听已属于模块自己，不再重复记录。
+                    if (longClickViews.add(view) && view.hasOnLongClickListeners()) {
+                        Log.d("CopyHook: RichTextView 已有长按监听，将被模块覆盖 class=${view.javaClass.name}")
+                    }
+                    view.setOnLongClickListener { v ->
                         Log.d("CopyHook: RichTextView longClick class=${v.javaClass.name} textLen=${(v as? TextView)?.text?.length ?: -1}")
                         (v as? TextView)?.text?.let { text ->
                             showLongPressCopyDialog(v.context, text)

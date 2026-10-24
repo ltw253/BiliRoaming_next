@@ -15,6 +15,11 @@ import java.lang.reflect.Modifier
 
 
 class CopyCommentHook(classLoader: ClassLoader) : BaseHook(classLoader) {
+    private companion object {
+        /** 同一菜单项的重复 dispatch 去重窗口（毫秒） */
+        private const val DISPATCH_DEDUPE_MS = 500L
+    }
+
     override fun startHook() {
         if (!sPrefs.getBoolean("copy_comment", false)) return
         // 对话框需要窗口 token，Application Context 会抛 BadTokenException
@@ -99,15 +104,37 @@ class CopyCommentHook(classLoader: ClassLoader) : BaseHook(classLoader) {
                 }
                 .toList()
         }
-        dispatchMethods?.forEach { method ->
+        val candidates = dispatchMethods.orEmpty()
+        // 同一逻辑链上可能同时存在"桥接方法"与真正的实现：例如 b(...) 只是转调
+        // invokeSuspend$lambda$1_0(...)，两者签名都符合筛选条件。若全部 hook，
+        // 一次点击会触发两次 after-hook、弹两次对话框。
+        // 策略：优先只 hook 名字含 lambda 的实现方法（两条调用路径最终都会落到它）；
+        // 若没有实现方法，则全部 hook，并由下面的时间去重兜底。
+        val lambdaMethods = candidates.filter { it.name.contains("lambda", ignoreCase = true) }
+        val toHook = if (lambdaMethods.isNotEmpty()) lambdaMethods else candidates
+        Log.d(
+            "CopyCommentHook: dispatch 候选 ${candidates.size} 个，hook ${toHook.size} 个：" +
+                    toHook.joinToString { m -> "${m.declaringClass.simpleName}#${m.name}" }
+        )
+        var lastDispatchAt = 0L
+        var lastMenuText: String? = null
+        toHook.forEach { method ->
             method.hookAfterMethod { param ->
                 val menu = param.args.getOrNull(1) ?: return@hookAfterMethod
-                Log.d("CopyCommentHook: menu dispatch ${method.declaringClass?.name} menu=$menu")
-                if (!menu.toString().contains("COPY")) return@hookAfterMethod
+                val menuText = menu.toString()
+                if (!menuText.contains("COPY")) return@hookAfterMethod
+                val now = System.currentTimeMillis()
+                if (menuText == lastMenuText && now - lastDispatchAt < DISPATCH_DEDUPE_MS) {
+                    Log.d("CopyCommentHook: 忽略重复 dispatch（间隔 ${now - lastDispatchAt}ms）")
+                    return@hookAfterMethod
+                }
+                lastDispatchAt = now
+                lastMenuText = menuText
+                Log.d("CopyCommentHook: menu dispatch ${method.declaringClass?.name}#${method.name}")
                 showCopyDialog(null)
             }
         }
-        if (dispatchMethods.isNullOrEmpty()) {
+        if (candidates.isEmpty()) {
             Log.d("new comment menu dispatch not found, skipping")
         }
     }
