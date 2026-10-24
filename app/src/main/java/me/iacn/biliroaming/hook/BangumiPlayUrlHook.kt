@@ -68,6 +68,21 @@ class BangumiPlayUrlHook(classLoader: ClassLoader) : BaseHook(classLoader) {
     private val defaultQn: Int?
         get() = instance.playerSettingHelperClass?.callStaticMethodAs<Int>(instance.getDefaultQn())
 
+    /**
+     * 取"同一视频"的标识：UGC 用 bvid；PGC 请求的 bvid 恒为空，
+     * 回退到 vod 的 cid / aid，否则 qnApplied 在该路径下永远不会复位。
+     */
+    private fun requestVideoKey(request: Any?): String? {
+        if (request == null) return null
+        val bvid = request.callMethod("getBvid") as? String
+        if (!bvid.isNullOrEmpty()) return bvid
+        val vod = request.callMethod("getVod") ?: return null
+        val cid = (vod.callMethod("getCid") as? Number)?.toLong() ?: -1L
+        if (cid > 0L) return "cid:$cid"
+        val aid = (vod.callMethod("getAid") as? Number)?.toLong() ?: -1L
+        return if (aid > 0L) "aid:$aid" else null
+    }
+
     override fun startHook() {
         if (!sPrefs.getBoolean("main_func", false)) return
         Log.d("startHook: BangumiPlayUrl")
@@ -289,16 +304,18 @@ class BangumiPlayUrlHook(classLoader: ClassLoader) : BaseHook(classLoader) {
 
         instance.playerMossClass?.run {
             var isDownload = false
-            var lastBvid: String? = null
+            var lastVideoKey: String? = null
             hookBeforeMethod(
                 if (instance.useNewMossFunc) "executePlayViewUnite" else "playViewUnite",
                 instance.playViewUniteReqClass
             ) { param ->
                 val request = param.args[0]
                 val bvid = request.callMethod("getBvid") as? String
-                // 换视频时重置，避免首页预加载把 qnApplied 消耗掉
-                if (!bvid.isNullOrEmpty() && bvid != lastBvid) {
-                    lastBvid = bvid
+                // 换视频时重置，避免首页预加载把 qnApplied 消耗掉。
+                // PGC 的 bvid 恒为空，这里回退到 cid/aid 作为视频标识。
+                val videoKey = requestVideoKey(request)
+                if (videoKey != null && videoKey != lastVideoKey) {
+                    lastVideoKey = videoKey
                     qnApplied.set(false)
                 }
                 val vod = request.callMethod("getVod") ?: return@hookBeforeMethod
@@ -407,9 +424,9 @@ class BangumiPlayUrlHook(classLoader: ClassLoader) : BaseHook(classLoader) {
                 instance.mossResponseHandlerClass
             ) { param ->
                 val request = param.args[0]
-                val bvid = request.callMethod("getBvid") as? String
-                if (!bvid.isNullOrEmpty() && bvid != lastBvid) {
-                    lastBvid = bvid
+                val videoKey = requestVideoKey(request)
+                if (videoKey != null && videoKey != lastVideoKey) {
+                    lastVideoKey = videoKey
                     qnApplied.set(false)
                 }
                 request.callMethod("getVod")?.apply {

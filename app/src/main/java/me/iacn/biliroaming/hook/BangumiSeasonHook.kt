@@ -225,11 +225,17 @@ class BangumiSeasonHook(classLoader: ClassLoader) : BaseHook(classLoader) {
             "com.bilibili.bangumi.ui.page.detail.BangumiDetailActivityV3".findClassOrNull(
                 mClassLoader
             )
-        val errorMessageHooker: Hooker = {
-            val activity = it.thisObject
-            if (bangumiDetailActivityV3Class == null ||
-                bangumiDetailActivityV3Class.isInstance(activity)
-            ) setErrorMessage(activity as Activity)
+        // 只有确认是番剧详情页时才处理：V3 类存在时用 isInstance 精确判定，
+        // 类整体缺失时退回类名匹配。绝不能"对所有 Activity 都生效"，
+        // 否则回退到 BaseToolbarActivity 时会为每个页面起一个 500ms 轮询协程。
+        val isBangumiDetailActivity: (Activity) -> Boolean = { activity ->
+            bangumiDetailActivityV3Class?.isInstance(activity)
+                ?: activity.javaClass.name.contains("BangumiDetailActivity")
+        }
+        val errorMessageHooker: Hooker = { param ->
+            (param.thisObject as? Activity)?.let { activity ->
+                if (isBangumiDetailActivity(activity)) setErrorMessage(activity)
+            }
         }
         if (bangumiDetailActivityV3Class != null &&
             runCatchingOrNull {
@@ -241,6 +247,7 @@ class BangumiSeasonHook(classLoader: ClassLoader) : BaseHook(classLoader) {
             )
         } else {
             // 9.8.0+: onCreate 上移至 BaseToolbarActivity
+            Log.d("BangumiSeasonHook: V3 未声明 onCreate，改 hook BaseToolbarActivity（按类名过滤）")
             "com.bilibili.lib.ui.BaseToolbarActivity".findClassOrNull(mClassLoader)
                 ?.hookAfterMethod("onCreate", Bundle::class.java, hooker = errorMessageHooker)
         }
@@ -256,6 +263,7 @@ class BangumiSeasonHook(classLoader: ClassLoader) : BaseHook(classLoader) {
             )
         } else {
             // 9.8.0+: onConfigurationChanged 上移至 BaseAppCompatActivity
+            Log.d("BangumiSeasonHook: V3 未声明 onConfigurationChanged，改 hook BaseAppCompatActivity（按类名过滤）")
             "com.bilibili.lib.ui.BaseAppCompatActivity".findClassOrNull(mClassLoader)
                 ?.hookAfterMethod(
                     "onConfigurationChanged", Configuration::class.java,

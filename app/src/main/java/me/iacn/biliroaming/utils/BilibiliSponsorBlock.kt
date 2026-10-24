@@ -59,6 +59,22 @@ object BilibiliSponsorBlock {
     private val cache = ConcurrentHashMap<String, CacheEntry>()
 
     private const val CACHE_TTL_MS = 30 * 60 * 1000L
+
+    /** 缓存对应的设置签名（服务器 + 启用分类），签名变化时整体失效。 */
+    private var cacheSignature: String? = null
+
+    /**
+     * 同步当前设置：服务器地址或启用分类变化时清空进程内缓存。
+     * 否则用户改了分类/服务器后，30 分钟内仍会命中按旧规则生成的结果（表现为设置不生效）。
+     */
+    fun syncSettings(server: String, enabledCategories: Set<String>) {
+        val signature =
+            server.trimEnd('/') + "|" + enabledCategories.sorted().joinToString(",")
+        if (signature != cacheSignature) {
+            cacheSignature = signature
+            cache.clear()
+        }
+    }
     private const val MIN_SEGMENT_MS = 250L
     private const val MAX_SEGMENT_SECONDS = 86_400.0
     private const val CONNECT_TIMEOUT_MS = 5_000
@@ -78,14 +94,17 @@ object BilibiliSponsorBlock {
     }
 
     /**
-     * 拉取并缓存该视频的片段。网络/解析失败返回空列表（并缓存空结果，避免频繁重试）。
+     * 拉取并缓存该视频的片段。
+     *
+     * 返回 null 表示本次拉取失败（网络异常 / 非 2xx / 解析异常），失败结果**不会**写入缓存，
+     * 调用方可自行重试；返回空列表表示服务端明确没有该视频的片段，属于有效结果，可以缓存。
      */
     fun fetch(
         bvid: String,
         cid: String,
         server: String,
         enabledCategories: Set<String>,
-    ): List<Segment> {
+    ): List<Segment>? {
         val segments = try {
             val prefix = sha256(bvid).take(4)
             val url = URL("${server.trimEnd('/')}/api/skipSegments/$prefix")
@@ -100,23 +119,27 @@ object BilibiliSponsorBlock {
                 val status = conn.responseCode
                 if (status !in 200..299) {
                     Log.e("SponsorBlock fetch HTTP $status for $bvid")
-                    emptyList()
-                } else {
-                    val body = conn.inputStream.bufferedReader().use { it.readText() }
-                    parse(body, bvid, enabledCategories)
+                    return null
                 }
+                val body = conn.inputStream.bufferedReader().use { it.readText() }
+                parse(body, bvid, cid, enabledCategories)
             } finally {
                 conn.disconnect()
             }
         } catch (e: Exception) {
             Log.e(e)
-            emptyList()
+            return null
         }
         cache["$bvid:$cid"] = CacheEntry(System.currentTimeMillis(), segments)
         return segments
     }
 
-    private fun parse(raw: String, bvid: String, enabledCategories: Set<String>): List<Segment> {
+    private fun parse(
+        raw: String,
+        bvid: String,
+        cid: String,
+        enabledCategories: Set<String>,
+    ): List<Segment> {
         if (raw.isBlank()) return emptyList()
         val result = mutableListOf<Segment>()
         val buckets = JSONArray(raw)
@@ -126,15 +149,24 @@ object BilibiliSponsorBlock {
             val array = bucket.optJSONArray("segments") ?: continue
             for (j in 0 until array.length()) {
                 val obj = array.optJSONObject(j) ?: continue
-                parseSegment(obj, enabledCategories)?.let { result += it }
+                parseSegment(obj, cid, enabledCategories)?.let { result += it }
             }
             break
         }
         return result.sortedBy { it.startMs }
     }
 
-    private fun parseSegment(json: JSONObject, enabledCategories: Set<String>): Segment? {
+    private fun parseSegment(
+        json: JSONObject,
+        cid: String,
+        enabledCategories: Set<String>,
+    ): Segment? {
         val segmentArray = json.optJSONArray("segment") ?: return null
+        // 同一 bvid 的多个分P 会一起返回，必须按 cid 过滤，
+        // 否则会拿别的分P 的时间轴去跳当前分P（多分P 串味）。
+        // 服务端未提供 cid 时不过滤，保持向后兼容，避免把片段全部丢弃。
+        val segmentCid = optStringOrNull(json, "cid")?.takeIf { it.isNotBlank() }
+        if (segmentCid != null && cid.isNotBlank() && segmentCid != cid) return null
         val category = optStringOrNull(json, "category")?.takeIf { it.isNotBlank() } ?: "sponsor"
         val actionType = optStringOrNull(json, "actionType")?.takeIf { it.isNotBlank() } ?: ACTION_SKIP
         if (category !in enabledCategories) return null
@@ -172,8 +204,10 @@ object BilibiliSponsorBlock {
     private fun optStringOrNull(json: JSONObject, key: String): String? =
         if (json.isNull(key)) null else json.optString(key)
 
-    private val digest by lazy { MessageDigest.getInstance("SHA-256") }
-
+    // MessageDigest 不是线程安全的，每次 fetch 都可能在不同 IO 协程上并行调用，
+    // 共享单例会导致 hash 前缀算错（进而拿到空结果）。这里每次新建实例。
     private fun sha256(text: String): String =
-        digest.digest(text.toByteArray()).joinToString("") { "%02x".format(it) }
+        MessageDigest.getInstance("SHA-256")
+            .digest(text.toByteArray())
+            .joinToString("") { "%02x".format(it) }
 }

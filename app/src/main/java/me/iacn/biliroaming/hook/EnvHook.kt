@@ -10,6 +10,27 @@ class EnvHook(classLoader: ClassLoader) : BaseHook(classLoader) {
     override fun startHook() {
         Log.d("startHook: Env")
 
+        // 兼容两种历史签名：旧版无参实例方法、新版 static(clazz) 方法。
+        // 两者都不匹配时明确记日志，避免"功能静默失效、无从排查"。
+        fun hookSignatureCompat(clazz: Class<*>, methodName: String, tag: String, hooker: Hooker) {
+            val target = clazz.declaredMethods.firstOrNull {
+                it.name == methodName && it.parameterTypes.isEmpty()
+            } ?: clazz.declaredMethods.firstOrNull {
+                it.name == methodName && it.parameterTypes.size == 1 &&
+                        it.parameterTypes[0] == clazz
+            }
+            if (target == null) {
+                Log.d(
+                    "EnvHook: $tag 在 ${clazz.name} 上未找到 $methodName 的兼容签名，" +
+                            "相关功能在 9.8.0 上可能不生效"
+                )
+                return
+            }
+            Log.d("EnvHook: $tag 挂钩 ${clazz.name}#${methodName}（${target.parameterTypes.size} 参）")
+            runCatching { target.hookAfterMethod(hooker) }
+                .onFailure { Log.e("EnvHook: $tag 挂钩失败: $it") }
+        }
+
         // EnvContext
         instance.preBuiltConfigClass?.let { clazz ->
             val hooker: Hooker = hooker@ { param ->
@@ -23,19 +44,7 @@ class EnvHook(classLoader: ClassLoader) : BaseHook(classLoader) {
             // v8.28.0 - ? 实例无参方法
             // ? - v8.48.0 .. 静态 (clazz) -> Map 方法（9.8.0 为 t(EnvContext)）
             instance.getPreBuiltConfigMethod()?.let { methodName ->
-                val noArgMethod = clazz.declaredMethods.firstOrNull {
-                    it.name == methodName && it.parameterTypes.isEmpty()
-                }
-                val staticThisMethod = clazz.declaredMethods.firstOrNull {
-                    it.name == methodName && it.parameterTypes.size == 1 &&
-                            it.parameterTypes[0] == clazz
-                }
-                when {
-                    noArgMethod != null ->
-                        runCatching { clazz.hookAfterMethod(methodName, hooker = hooker) }
-                    staticThisMethod != null ->
-                        runCatching { clazz.hookAfterMethod(methodName, clazz, hooker = hooker) }
-                }
+                hookSignatureCompat(clazz, methodName, "preBuiltConfig", hooker)
             }
         }
 
@@ -53,19 +62,7 @@ class EnvHook(classLoader: ClassLoader) : BaseHook(classLoader) {
             // v8.28.0 - ? 实例无参方法
             // ? - v8.48.0 .. 静态 (clazz) -> SharedPreferences 方法（9.8.0 为 f(TypedContext)）
             instance.getDataSPMethod()?.let { methodName ->
-                val noArgMethod = clazz.declaredMethods.firstOrNull {
-                    it.name == methodName && it.parameterTypes.isEmpty()
-                }
-                val staticThisMethod = clazz.declaredMethods.firstOrNull {
-                    it.name == methodName && it.parameterTypes.size == 1 &&
-                            it.parameterTypes[0] == clazz
-                }
-                when {
-                    noArgMethod != null ->
-                        runCatching { clazz.hookAfterMethod(methodName, hooker = hooker) }
-                    staticThisMethod != null ->
-                        runCatching { clazz.hookAfterMethod(methodName, clazz, hooker = hooker) }
-                }
+                hookSignatureCompat(clazz, methodName, "dataSP", hooker)
             }
         }
 

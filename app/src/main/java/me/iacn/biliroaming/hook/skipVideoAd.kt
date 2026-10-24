@@ -6,7 +6,9 @@ import android.os.Handler
 import android.os.Looper
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import me.iacn.biliroaming.BiliBiliPackage.Companion.instance
 import me.iacn.biliroaming.utils.BilibiliSponsorBlock
@@ -32,6 +34,9 @@ class SkipVideoAd(classLoader: ClassLoader) : BaseHook(classLoader) {
 
     companion object {
         private const val LOOKAHEAD_MS = 250L
+
+        /** 静音兜底恢复的宽限时间：片段结束后再多等这么久仍无回调就强制解除静音。 */
+        private const val MUTE_WATCHDOG_GRACE_MS = 5_000L
     }
 
     private var lastSeekTime = 0L
@@ -41,11 +46,26 @@ class SkipVideoAd(classLoader: ClassLoader) : BaseHook(classLoader) {
 
     @Volatile
     private var segments: List<BilibiliSponsorBlock.Segment> = emptyList()
+    @Volatile
     private var bvid = ""
+    @Volatile
     private var cid = ""
 
     private val skipped = HashSet<String>()
+    @Volatile
     private var muted = false
+
+    // 当前拉取片段的任务：切换视频时取消，避免旧视频的结果覆盖新视频。
+    private var fetchJob: Job? = null
+
+    // 静音兜底：ADJUST_MUTE 是系统级媒体流标志，若回调停止（暂停/退出/被杀前），
+    // 必须保证还能恢复，否则设备会一直没声音。
+    private val muteWatchdog = Runnable {
+        if (muted) {
+            Log.d("mute watchdog fired, restore audio")
+            setMuted(false)
+        }
+    }
 
     // 设置快照：进入新视频时刷新，避免每帧读 MODE_MULTI_PROCESS 的 SharedPreferences。
     @Volatile private var server = BilibiliSponsorBlock.DEFAULT_SERVER
@@ -105,12 +125,29 @@ class SkipVideoAd(classLoader: ClassLoader) : BaseHook(classLoader) {
         }
 
         instance.playerCoreServiceV2Class?.apply {
-            val stateMethod = declaredMethods.firstOrNull {
+            // 播放器状态回调：9.8.0 是 r(I)V，旧版是 G1(I)V。
+            // 额外要求返回 void，避免同类里的同名重载被误选；
+            // 找不到时明确记日志，而不是静默地"开了但什么都不跳"。
+            val stateCandidates = declaredMethods.filter {
                 (it.name == "G1" || it.name == "r") && it.parameterTypes.size == 1 &&
-                    it.parameterTypes[0] == Int::class.javaPrimitiveType
-            }?.name
-            stateMethod?.let { name ->
-                hookAfterMethod(name, Int::class.java) { param ->
+                    it.parameterTypes[0] == Int::class.javaPrimitiveType &&
+                    it.returnType == java.lang.Void.TYPE
+            }
+            if (stateCandidates.size > 1) {
+                Log.d(
+                    "SkipVideoAd: 状态回调有多个候选，取第一个：" +
+                            stateCandidates.joinToString { m ->
+                                m.name + m.parameterTypes.contentToString()
+                            }
+                )
+            }
+            val stateMethod = stateCandidates.firstOrNull()
+            if (stateMethod == null) {
+                Log.d("SkipVideoAd: 未找到播放器状态回调 G1/r(I)V，跳过与静音可能不工作")
+            } else {
+                Log.d("SkipVideoAd: 状态回调 = ${stateMethod.name}(I)V")
+                // 用精确 Member 挂钩，避免 findAndHookMethod 按名字+参数重新查找时选到同签名重载
+                stateMethod.hookAfterMethod { param ->
                     playerRef = WeakReference(param.thisObject)
                     val state = param.args[0] as Int
                     if (state in 3..5 && duration <= 0) {
@@ -143,16 +180,24 @@ class SkipVideoAd(classLoader: ClassLoader) : BaseHook(classLoader) {
             segments = BilibiliSponsorBlock.cached(currentBvid, currentCid).orEmpty()
             return
         }
-        CoroutineScope(Dispatchers.IO).launch {
+        // 取消上一轮的拉取，避免旧视频的结果在新视频播放期间覆盖 segments。
+        fetchJob?.cancel()
+        fetchJob = CoroutineScope(Dispatchers.IO).launch {
             var retryCount = 0
             val maxRetries = 3
-            while (retryCount < maxRetries) {
+            while (isActive && retryCount < maxRetries) {
                 val result = BilibiliSponsorBlock.fetch(
                     currentBvid, currentCid, server, enabledCategories
                 )
-                // 只有真的拿到片段才算成功；空结果也重试，避免服务端偶发抖动导致整集不跳。
-                segments = result
-                if (result.isNotEmpty()) break
+                // fetch 返回 null 表示本次失败（不写缓存），可以重试；
+                // 空列表表示服务端确实没有片段，属于有效结果。
+                if (result != null) {
+                    // 写入前确认仍然是同一个视频，否则丢弃这一批过期结果。
+                    if (bvid == currentBvid && cid == currentCid) {
+                        segments = result
+                    }
+                    break
+                }
                 retryCount++
                 if (retryCount < maxRetries) delay(1000)
             }
@@ -172,11 +217,17 @@ class SkipVideoAd(classLoader: ClassLoader) : BaseHook(classLoader) {
             ?.toFloatOrNull()?.times(1000f) ?: 0f).toLong()
         countdownMs = (sPrefs.getString("skip_video_ad_countdown", "0")
             ?.toFloatOrNull()?.times(1000f) ?: 0f).toLong()
+        // 服务器地址或启用分类变化时让进程内缓存失效，否则改完设置仍会用旧结果
+        BilibiliSponsorBlock.syncSettings(server, enabledCategories)
     }
 
     private fun onProgress(positionMs: Long) {
         if (duration <= 0L) return
         val position = positionMs.coerceIn(0L, duration)
+
+        // 静音状态机必须放在倒计时提前返回之前：否则倒计时期间进入的静音片段不会静音，
+        // 离开片段时也不会恢复音频，而且会掩盖 setMuted 的兜底解除。
+        updateMuteState(position)
 
         // 倒计时进行中：离开片段则取消，否则等待回调触发跳过。
         countdownSegment?.let { seg ->
@@ -185,17 +236,6 @@ class SkipVideoAd(classLoader: ClassLoader) : BaseHook(classLoader) {
             } else {
                 return
             }
-        }
-
-        if (muteEnabled) {
-            val muteSegment = segments.firstOrNull {
-                it.actionType == BilibiliSponsorBlock.ACTION_MUTE &&
-                    it.durationMs >= minDurationMs &&
-                    position >= it.startMs && position < it.endMs
-            }
-            setMuted(muteSegment != null)
-        } else if (muted) {
-            setMuted(false)
         }
 
         if (!autoSkip) return
@@ -274,6 +314,30 @@ class SkipVideoAd(classLoader: ClassLoader) : BaseHook(classLoader) {
         }
     }
 
+    private fun updateMuteState(position: Long) {
+        if (!muteEnabled) {
+            if (muted) setMuted(false)
+            return
+        }
+        val muteSegment = segments.firstOrNull {
+            it.actionType == BilibiliSponsorBlock.ACTION_MUTE &&
+                it.durationMs >= minDurationMs &&
+                position >= it.startMs && position < it.endMs
+        }
+        setMuted(muteSegment != null)
+        if (muteSegment != null) {
+            // 以"片段剩余时长 + 宽限"布防：即使之后进度回调完全停止（暂停/退出播放页），
+            // 也能保证音频最终被恢复。
+            val remaining = (muteSegment.endMs - position).coerceAtLeast(1_000L)
+            armMuteWatchdog(remaining + MUTE_WATCHDOG_GRACE_MS)
+        }
+    }
+
+    private fun armMuteWatchdog(delayMs: Long) {
+        handler.removeCallbacks(muteWatchdog)
+        handler.postDelayed(muteWatchdog, delayMs)
+    }
+
     private fun setMuted(mute: Boolean) {
         if (mute == muted) return
         val audioManager = try {
@@ -286,6 +350,7 @@ class SkipVideoAd(classLoader: ClassLoader) : BaseHook(classLoader) {
                 audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0)
             } else {
                 audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
+                handler.removeCallbacks(muteWatchdog)
             }
             muted = mute
         } catch (e: Exception) {

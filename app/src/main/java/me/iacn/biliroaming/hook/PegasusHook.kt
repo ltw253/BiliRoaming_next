@@ -57,14 +57,19 @@ class PegasusHook(classLoader: ClassLoader) : BaseHook(classLoader) {
         sPrefs.getStringSet("home_filter_keywords_channel", null).orEmpty()
     }
     private val disableAutoRefresh = sPrefs.getBoolean("disable_auto_refresh", false)
-    private val removeRelatePromote = sPrefs.getBoolean("remove_video_relate_promote", true)
+    // 默认值必须与设置界面一致：prefs_setting.xml 里该 SwitchPreference 没有 defaultValue，
+    // 显示为"关"；此开关又依赖 hidden，未开隐藏功能时是置灰的，用户改不了。
+    // 若这里默认 true，就会出现"界面显示关、实际默认移除相关推广"且无法关闭。
+    private val removeRelatePromote = sPrefs.getBoolean("remove_video_relate_promote", false)
     private val removeRelateOnlyAv = sPrefs.getBoolean("remove_video_relate_only_av", false)
     private val removeRelateNothing = sPrefs.getBoolean("remove_video_relate_nothing", false)
     private val applyToRelate = sPrefs.getBoolean("home_filter_apply_to_relate", false)
 
     private val hideTopEntrance = sPrefs.getBoolean("hide_top_entrance_popular", false)
     private val hideSuggestFollow = sPrefs.getBoolean("hide_suggest_follow_popular", false)
-    private val hideTopicList = sPrefs.getBoolean("hide_topic_list_popular", true)
+    // 同上：HomeFilterDialog 读取的默认值是 false，这里保持一致，
+    // 否则默认就会隐藏热门页话题卡片，且用户无法在界面关闭。
+    private val hideTopicList = sPrefs.getBoolean("hide_topic_list_popular", false)
 
     private val filterMap = mapOf(
         "advertisement" to listOf("ad", "cm", "cm_v2"),

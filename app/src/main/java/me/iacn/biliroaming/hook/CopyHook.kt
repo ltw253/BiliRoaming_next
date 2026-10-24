@@ -35,13 +35,8 @@ class CopyHook(classLoader: ClassLoader) : BaseHook(classLoader) {
     override fun startHook() {
         if (!sPrefs.getBoolean("comment_copy", false)) return
 
-        // 诊断：记录 Activity 类名 + WebView 加载的 URL，判断动态详情是 Compose 还是 H5
-        android.app.Activity::class.java.hookAfterMethod("onResume") { param ->
-            Log.d("CopyHook: Activity onResume ${param.thisObject.javaClass.name}")
-        }
-        android.webkit.WebView::class.java.hookAfterMethod("loadUrl", String::class.java) { param ->
-            Log.d("CopyHook: WebView loadUrl ${param.args[0]}")
-        }
+        // 记录当前 Activity，供需要窗口 token 的对话框使用（不再记录 URL / 界面类名，避免隐私外泄）
+        CurrentActivity.install()
         instance.descCopyView().zip(instance.descCopy()).forEach { p ->
             val clazz = p.first ?: return@forEach
             val method = p.second ?: return@forEach
@@ -182,14 +177,6 @@ class CopyHook(classLoader: ClassLoader) : BaseHook(classLoader) {
                     }
                 }
 
-            // 诊断：记录动态/评论相关 View 的长按类名，定位动态正文与动态评论控件
-            val loggedLongClickClasses = java.util.Collections.synchronizedSet(mutableSetOf<String>())
-            View::class.java.hookAfterMethod("performLongClick") { param ->
-                val cls = param.thisObject.javaClass.name
-                if (loggedLongClickClasses.add(cls)) {
-                    Log.d("CopyHook: performLongClick class=$cls")
-                }
-            }
         }
 
         if (!enhanceLongClickCopy) return

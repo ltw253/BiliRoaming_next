@@ -1,8 +1,11 @@
 package me.iacn.biliroaming.hook
 
+import android.app.Activity
 import android.app.AlertDialog
+import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.view.View
 import android.widget.TextView
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedHelpers
@@ -14,6 +17,8 @@ import java.lang.reflect.Modifier
 class CopyCommentHook(classLoader: ClassLoader) : BaseHook(classLoader) {
     override fun startHook() {
         if (!sPrefs.getBoolean("copy_comment", false)) return
+        // 对话框需要窗口 token，Application Context 会抛 BadTokenException
+        CurrentActivity.install()
         hookLegacyMenuHolder()
         // 新菜单分发方法的查找涉及类枚举，耗时较大，移到后台线程避免阻塞启动
         Thread({
@@ -39,10 +44,19 @@ class CopyCommentHook(classLoader: ClassLoader) : BaseHook(classLoader) {
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         super.afterHookedMethod(param)
-                        showCopyDialog()
+                        showCopyDialog((param.args.getOrNull(2) as? View)?.context)
                     }
                 })
-        }.onFailure { Log.d("legacy comment menu holder not found, skipping") }
+        }.onFailure { e ->
+            // 区分"类不存在（正常降级）"和"挂钩真实出错"，否则真异常会被伪装成 not found。
+            // 注意：Xposed 抛的是 XposedHelpers$ClassNotFoundError（继承 Error 而非 Exception），
+            // 且 Android 上 simpleName 对内部类不可靠，故用完整类名包含判断。
+            if (e is ClassNotFoundException || e.javaClass.name.contains("ClassNotFoundError")) {
+                Log.d("legacy comment menu holder not found, skipping")
+            } else {
+                Log.e("legacy comment menu holder hook failed: $e")
+            }
+        }
     }
 
     /**
@@ -90,7 +104,7 @@ class CopyCommentHook(classLoader: ClassLoader) : BaseHook(classLoader) {
                 val menu = param.args.getOrNull(1) ?: return@hookAfterMethod
                 Log.d("CopyCommentHook: menu dispatch ${method.declaringClass?.name} menu=$menu")
                 if (!menu.toString().contains("COPY")) return@hookAfterMethod
-                showCopyDialog()
+                showCopyDialog(null)
             }
         }
         if (dispatchMethods.isNullOrEmpty()) {
@@ -98,22 +112,36 @@ class CopyCommentHook(classLoader: ClassLoader) : BaseHook(classLoader) {
         }
     }
 
-    private fun showCopyDialog() {
+    private fun showCopyDialog(anchor: Context?) {
         val clipboard =
             currentContext.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         // 实在是找不到了。那你就说有没有获取到吧
         val txt = runCatchingOrNull {
             clipboard.primaryClip?.getItemAt(0)?.text
-        } ?: return
-        AlertDialog.Builder(currentContext, getResId("AppTheme.Dialog.Alert", "style"))
+        }
+        if (txt.isNullOrEmpty()) {
+            Log.d("CopyCommentHook: 剪贴板为空，跳过对话框")
+            return
+        }
+        // Application Context 没有窗口 token，show() 会抛 WindowManager.BadTokenException，
+        // 所以优先用触发点的 View/Activity 上下文，退回到最近 resumed 的 Activity。
+        val dialogContext = (anchor as? Activity) ?: CurrentActivity.activity ?: run {
+            Log.d("CopyCommentHook: 没有可用的 Activity 上下文，跳过对话框")
+            return
+        }
+        AlertDialog.Builder(dialogContext, getResId("AppTheme.Dialog.Alert", "style"))
             .run {
                 setTitle("自由复制内容")
                 setMessage(txt)
                 setPositiveButton("完成") { _, _ -> }
-                setNegativeButton("复制全部") { _, _ -> }
+                setNegativeButton("复制全部") { _, _ ->
+                    runCatchingOrNull {
+                        clipboard.setPrimaryClip(ClipData.newPlainText("", txt))
+                    }
+                }
                 show()
             }.apply {
-                findViewById<TextView>(android.R.id.message).setTextIsSelectable(true)
+                findViewById<TextView>(android.R.id.message)?.setTextIsSelectable(true)
             }
     }
 }

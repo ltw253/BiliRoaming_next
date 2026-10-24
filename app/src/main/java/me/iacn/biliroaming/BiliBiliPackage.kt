@@ -2069,29 +2069,13 @@ class BiliBiliPackage constructor(private val mClassLoader: ClassLoader, mContex
                 class_ = class_ { name = getDefaultQnMethod.declaringClass.name }
                 getDefaultQn = method { name = getDefaultQnMethod.name }
             }
-            val autoSupremumQualityClass = dexHelper.findMethodUsingString(
-                "AutoSupremumQuality(loginHalfScreen=",
-                false,
-                -1,
-                -1,
-                null,
-                -1,
-                null,
-                null,
-                null,
-                true
-            ).asSequence().firstNotNullOfOrNull {
-                dexHelper.decodeMethodIndex(it)
-            }?.declaringClass?.also {
-                autoSupremumQuality = autoSupremumQuality {
-                    class_ = class_ {
-                        name = it.name
-                    }
-                }
-            }
-            qualityStrategyProvider = qualityStrategyProvider {
-                val buildStrategyMethod = dexHelper.findMethodUsingString(
-                    "Quality Strategy share:",
+            // 锚点字符串会随版本消失：9.8.0 起 "AutoSupremumQuality" 机制已被移除，
+            // "Quality Strategy share:" 也改成了 rangeQualityStrategy 相关日志。
+            // 因此逐个尝试，全部失败时保持为 null（相关 hook 自然跳过）并打印诊断，
+            // 避免"静默失效、无从判断"。
+            fun findDeclaringClassByString(anchor: String): Class<*>? =
+                dexHelper.findMethodUsingString(
+                    anchor,
                     false,
                     -1,
                     -1,
@@ -2103,16 +2087,52 @@ class BiliBiliPackage constructor(private val mClassLoader: ClassLoader, mContex
                     true
                 ).asSequence().firstNotNullOfOrNull {
                     dexHelper.decodeMethodIndex(it)
-                } ?: return@qualityStrategyProvider
+                }?.declaringClass
+
+            val autoSupremumQualityClass = sequenceOf(
+                "AutoSupremumQuality(loginHalfScreen=",
+                "SupremumQuality(login",
+                "loginHalfScreen="
+            ).firstNotNullOfOrNull { findDeclaringClassByString(it) }?.also {
+                autoSupremumQuality = autoSupremumQuality {
+                    class_ = class_ {
+                        name = it.name
+                    }
+                }
+            }
+            Log.d("quality: autoSupremumQuality=${autoSupremumQualityClass?.name ?: "null"}")
+
+            qualityStrategyProvider = qualityStrategyProvider {
+                val buildStrategyMethod = sequenceOf(
+                    "Quality Strategy share:",
+                    "Quality Strategy rangeQualityStrategy specialQualityHalfRangeFlow:",
+                    "Quality Strategy rangeQualityStrategy"
+                ).firstNotNullOfOrNull { anchor ->
+                    dexHelper.findMethodUsingString(
+                        anchor,
+                        false,
+                        -1,
+                        -1,
+                        null,
+                        -1,
+                        null,
+                        null,
+                        null,
+                        true
+                    ).asSequence().firstNotNullOfOrNull { dexHelper.decodeMethodIndex(it) }
+                } ?: run {
+                    Log.d("quality: provider anchor not found")
+                    return@qualityStrategyProvider
+                }
                 val providerClass = buildStrategyMethod.declaringClass
                 val selectQualityMethod = providerClass.declaredMethods.asSequence().filter {
-                    it.parameterCount == 3 && it.parameterTypes.contentEquals(
-                        arrayOf(
-                            autoSupremumQualityClass,
-                            Boolean::class.javaPrimitiveType,
-                            Boolean::class.javaPrimitiveType
-                        )
-                    )
+                    // 旧版签名首参是 AutoSupremumQuality；该类型不存在时放宽首参约束，
+                    // 仍然要求后两个参数是 boolean，保证 hook 到的语义范围不变。
+                    it.parameterCount == 3 &&
+                        it.parameterTypes[1] == Boolean::class.javaPrimitiveType &&
+                        it.parameterTypes[2] == Boolean::class.javaPrimitiveType &&
+                        (autoSupremumQualityClass == null ||
+                            it.parameterTypes[0] == autoSupremumQualityClass)
                 }.firstNotNullOfOrNull { method ->
                     val methodIdx = dexHelper.encodeMethodIndex(method)
                     val isConnectedMethods = dexHelper.findMethodInvoking(
@@ -2127,9 +2147,13 @@ class BiliBiliPackage constructor(private val mClassLoader: ClassLoader, mContex
                         true
                     )
                     if (isConnectedMethods.isEmpty()) method else null
-                } ?: return@qualityStrategyProvider
+                } ?: run {
+                    Log.d("quality: selectQuality not found in ${providerClass.name}")
+                    return@qualityStrategyProvider
+                }
                 class_ = class_ { name = providerClass.name }
                 selectQuality = method { name = selectQualityMethod.name }
+                Log.d("quality: selectQuality=${providerClass.name}#${selectQualityMethod.name}")
             }
             liveRtcHelper = liveRtcHelper {
                 val liveRtcEnable = dexHelper.findMethodUsingString(
@@ -2504,7 +2528,9 @@ class BiliBiliPackage constructor(private val mClassLoader: ClassLoader, mContex
                     "com.bilibili.ad.reward.activity.BaseRewardAdActivity".from(classloader)
                         ?: rewardAdActivityClass
                 class_ = class_ { name = rewardAdHookClass.name }
-                // 9.14/9.8: RewardAdActivity 继承自 BaseRewardAdActivity，标志位在父类中
+                // 9.14/9.8: RewardAdActivity 继承自 BaseRewardAdActivity，标志位在父类中。
+                // declaredFields 顺序在规范里没有保证，因此优先按已知字段名匹配，
+                // 取不到时才退回"层级中第 2 个布尔字段"的旧启发式。
                 var clazz: Class<*>? = rewardAdActivityClass
                 val rewardFlagFields = mutableListOf<java.lang.reflect.Field>()
                 while (clazz != null) {
@@ -2513,7 +2539,13 @@ class BiliBiliPackage constructor(private val mClassLoader: ClassLoader, mContex
                     }
                     clazz = clazz.superclass
                 }
-                val rewardFlagField = rewardFlagFields.getOrNull(1) ?: return@rewardAd
+                val preferredRewardFlagNames = listOf(
+                    "E1", "rewardFlag", "isRewarded", "mRewarded", "hasReward"
+                )
+                val rewardFlagField = rewardFlagFields.firstOrNull {
+                    it.name in preferredRewardFlagNames
+                } ?: rewardFlagFields.getOrNull(1) ?: return@rewardAd
+                Log.d("rewardAd class_=${rewardAdHookClass.name} rewardFlag=${rewardFlagField.name}")
 
                 rewardFlag = field { name = rewardFlagField.name }
 
