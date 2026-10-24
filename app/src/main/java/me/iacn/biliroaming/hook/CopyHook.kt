@@ -269,7 +269,7 @@ class CopyHook(classLoader: ClassLoader) : BaseHook(classLoader) {
             setNegativeButton(android.R.string.cancel, null)
             show()
         }.apply {
-            findViewById<TextView>(android.R.id.message).setTextIsSelectable(true)
+            findViewById<TextView>(android.R.id.message)?.setTextIsSelectable(true)
         }
     }
 
@@ -295,7 +295,7 @@ class CopyHook(classLoader: ClassLoader) : BaseHook(classLoader) {
             setNegativeButton(android.R.string.cancel, null)
             show()
         }.apply {
-            findViewById<TextView>(android.R.id.message).setTextIsSelectable(true)
+            findViewById<TextView>(android.R.id.message)?.setTextIsSelectable(true)
         }
     }
 }

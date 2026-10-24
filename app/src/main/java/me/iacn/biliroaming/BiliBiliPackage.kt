@@ -2238,7 +2238,9 @@ class BiliBiliPackage constructor(private val mClassLoader: ClassLoader, mContex
                         null,
                         false
                     ).asSequence().firstNotNullOfOrNull { idx ->
-                        dexHelper.decodeMethodIndex(idx)?.declaringClass?.takeIf { !it.superclass.isAbstract }
+                        // superclass 对接口/Object 为 null，这里显式判空，避免 NPE
+                        dexHelper.decodeMethodIndex(idx)?.declaringClass
+                            ?.takeIf { it.superclass?.isAbstract == false }
                     } ?: return@biliGlobalPreference
                 val method = clazz.declaredMethods.firstOrNull {
                     it.isStatic && it.parameterTypes.isEmpty() && it.returnType == SharedPreferences::class.java

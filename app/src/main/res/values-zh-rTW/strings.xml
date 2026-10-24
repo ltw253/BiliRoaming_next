@@ -188,6 +188,10 @@
     <string name="remove_video_relate_nothing_summary">上個選項的基礎上，將UP主投稿影片也移除</string>
     <string name="remove_video_cmd_dms_title">移除影片浮窗</string>
     <string name="remove_video_cmd_dms_summary">移除影片播放時出現的浮窗，包括三連關注、關聯影片、投票彈幕、評分彈幕、投資目前UP主、跳轉應用程式、免流引導等</string>
+    <string name="remove_home_ads_title">去除首頁廣告</string>
+    <string name="remove_home_ads_summary">過濾首頁推薦流中的廣告卡片（無需開啟淨化推薦流）</string>
+    <string name="remove_pause_ad_title">去除暫停廣告</string>
+    <string name="remove_pause_ad_summary">去除影片暫停數秒後彈出的廣告面板，保留暫停頁推薦內容</string>
     <string name="block_word_search_title">封鎖評論關鍵字搜尋功能</string>
     <string name="block_word_search_summary">封鎖影片評論藍色關鍵字點擊觸發跳轉搜尋功能</string>
     <string name="disable_try_watch_vip_quality_title">禁用免費試看大會員解析度</string>
