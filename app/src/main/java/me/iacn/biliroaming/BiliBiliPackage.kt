@@ -1623,10 +1623,17 @@ class BiliBiliPackage constructor(private val mClassLoader: ClassLoader, mContex
                 } ?: return@okIOBuffer
                 readFrom = method { name = okioReadFromMethod.name }
             }
-            classesList.filter {
-                it.startsWith("com.bilibili.bplus.followinglist.module.item")
-                        && View.OnLongClickListener::class.java.isAssignableFrom(it.on(classloader))
-            }.let { l -> dynDescHolderListener.addAll(l.toList().map { class_ { name = it } }) }
+            // 该包下部分类可能无法用当前 ClassLoader 加载（split/插件类），
+            // 直接 it.on(classloader) 抛异常会让整段过滤中断，最终 holder 解析为 0。
+            classesList.filter { name ->
+                name.startsWith("com.bilibili.bplus.followinglist.module.item") &&
+                    runCatchingOrNull {
+                        View.OnLongClickListener::class.java.isAssignableFrom(name.on(classloader))
+                    } == true
+            }.let { l ->
+                Log.d("dynamicDesc: holders=${l.count()}")
+                dynDescHolderListener.addAll(l.toList().map { class_ { name = it } })
+            }
             descCopy = descCopy {
                 classesList.filter {
                     it.startsWith("com.bilibili.ship.theseus.ugc.intro.ugcheadline.UgcIntroductionComponent")

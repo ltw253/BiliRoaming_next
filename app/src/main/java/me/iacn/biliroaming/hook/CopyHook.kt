@@ -6,9 +6,12 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.os.SystemClock
 import android.text.SpannableStringBuilder
 import android.text.style.ClickableSpan
+import android.view.MotionEvent
 import android.view.View
+import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.PopupWindow
 import android.widget.TextView
@@ -28,13 +31,51 @@ class CopyHook(classLoader: ClassLoader) : BaseHook(classLoader) {
 
         // 简介视图 -> 完整简介文本
         private val descFullText = java.util.WeakHashMap<View, String>()
+
+        /** Activity 层长按识别阈值 */
+        private const val LONG_PRESS_MS = 600L
+        private const val LONG_PRESS_SLOP = 24f
+
+        /**
+         * 启用长按兜底的页面类名关键字。
+         * 9.8.0 的动态/opus 详情页类名不一定包含 "detail"，因此放宽为一组关键字；
+         * 非目标页面只记录一次日志，便于后续定位新页面。
+         */
+        private val TARGET_PAGE_KEYWORDS = arrayOf(
+            "detail", "opus", "dynamic", "followinglist", "intro", "bangumi"
+        )
     }
 
     private val enhanceLongClickCopy = sPrefs.getBoolean("comment_copy_enhance", false)
 
+    // Activity 层长按兜底：9.8.0 的简介控件只在带 span 的小区域回调 performLongClick，
+    // 而且它的继承方法无法用 findAndHookMethod 挂载，没法靠给视图装监听覆盖整块文字。
+    // 因此在 dispatchTouchEvent 里自行识别长按，再按坐标命中真正显示文本的视图。
+    @Volatile
+    private var pressDownAt = 0L
+
+    @Volatile
+    private var pressDownX = 0f
+
+    @Volatile
+    private var pressDownY = 0f
+
     // 已装过长按监听的 RichTextView（弱引用），用于只记录"首次覆盖 App 监听"的诊断
     private val longClickViews =
         java.util.Collections.newSetFromMap(java.util.WeakHashMap<View, Boolean>())
+
+    // 已给哪些简介视图装过长按监听（弱引用），避免 setText/setter 反复安装
+    private val descLongClickViews =
+        java.util.Collections.newSetFromMap(java.util.WeakHashMap<View, Boolean>())
+
+    // 已经深度安装过长按监听的 View（弱引用）：简介/评论的文字常由子 View 绘制，
+    // 只给容器装监听会出现"只有容器空白处（左侧一小块）能长按"的问题。
+    private val deepLongClickViews =
+        java.util.Collections.newSetFromMap(java.util.WeakHashMap<View, Boolean>())
+
+    // 长按兜底"跳过"过的页面类名（只记一次，避免刷屏）
+    private val loggedSkipPages =
+        java.util.Collections.synchronizedSet(java.util.LinkedHashSet<String>())
 
     override fun startHook() {
         if (!sPrefs.getBoolean("comment_copy", false)) return
@@ -64,11 +105,55 @@ class CopyHook(classLoader: ClassLoader) : BaseHook(classLoader) {
         // 不再自带复制监听器，且原 (View, ClickableSpan) 渲染方法已不存在。
         // 在简介文本 setter 触发时捕获全文，并拦截 performLongClick 弹复制对话框
         if (enhanceLongClickCopy) {
+            installDetailLongPressFallback()
             "tv.danmaku.bili.videopage.common.widget.view.ExpandableTextView"
                 .findClassOrNull(mClassLoader)?.let { clazz ->
                     Log.d("hooked desc copy view: ${clazz.name}")
+                    // 诊断（有界）：记录实际收到长按的 View 类名，用于定位 9.8.0 简介控件真实类型。
+                    // 每个类只记一次，最多 40 个，避免刷屏。
+                    val loggedLongClickClasses =
+                        java.util.Collections.synchronizedSet(java.util.LinkedHashSet<String>())
+                    View::class.java.hookAfterMethod("performLongClick") { param ->
+                        val cls = param.thisObject.javaClass.name
+                        if (cls.startsWith("android.") || cls.startsWith("androidx.") ||
+                            cls.startsWith("kotlin.")
+                        ) {
+                            return@hookAfterMethod
+                        }
+                        if (loggedLongClickClasses.size < 40 && loggedLongClickClasses.add(cls)) {
+                            Log.d("CopyHook: longClick view class=$cls")
+                        }
+                    }
+                    fun installDescLongClick(view: View) {
+                        if (view.javaClass.name.endsWith("ExpandableTextView") &&
+                            descLongClickViews.add(view)
+                        ) {
+                            Log.d(
+                                "CopyHook: 简介视图状态 class=${view.javaClass.name} " +
+                                        "attached=${view.isAttachedToWindow} shown=${view.isShown} " +
+                                        "longClickable=${view.isLongClickable} " +
+                                        "hasLongClick=${view.hasOnLongClickListeners()}"
+                            )
+                        }
+                        installLongClickDeep(view, { pressed ->
+                            val full = descFullText[pressed]?.takeIf { it.isNotEmpty() }
+                                ?: descFullText[view]?.takeIf { it.isNotEmpty() }
+                            if (full.isNullOrEmpty()) return@installLongClickDeep false
+                            Log.d(
+                                "CopyHook: 简介长按触发 class=${pressed.javaClass.name} " +
+                                        "textLen=${full.length}"
+                            )
+                            showLongPressCopyDialog(pressed.context, full)
+                            true
+                        }, "简介")
+                    }
                     listOf("T", "setOriginText", "setExpandedDesc", "setRetractedDesc").forEach { name ->
+                        var loggedOnce = false
                         clazz.hookAfterAllMethods(name) { param ->
+                            if (!loggedOnce) {
+                                loggedOnce = true
+                                Log.d("CopyHook: 简介 setter 命中 $name")
+                            }
                             val view = param.thisObject as? View ?: return@hookAfterAllMethods
                             val text = extractDescText(param.args.getOrNull(0))?.toString()
                             if (text != null) {
@@ -79,7 +164,44 @@ class CopyHook(classLoader: ClassLoader) : BaseHook(classLoader) {
                                     descFullText[view] = text
                                 }
                             }
+                            installDescLongClick(view)
                         }
+                    }
+                    // 部分路径直接用 setText 设置简介文本，同样要捕获全文并安装长按监听
+                    clazz.hookAfterMethod(
+                        "setText", CharSequence::class.java, TextView.BufferType::class.java
+                    ) { param ->
+                        val view = param.thisObject as? View ?: return@hookAfterMethod
+                        val text = (param.args.getOrNull(0) as? CharSequence)?.toString()
+                        if (!text.isNullOrEmpty()) {
+                            val old = descFullText[view]
+                            if (old == null || text.length > old.length) descFullText[view] = text
+                        }
+                        installDescLongClick(view)
+                    }
+                    // 诊断：触摸是否真的到达简介视图（用于判断长按是否被上层拦截）
+                    var touchLogged = false
+                    clazz.hookAfterMethod("onTouchEvent", MotionEvent::class.java) { _ ->
+                        if (!touchLogged) {
+                            touchLogged = true
+                            Log.d("CopyHook: 简介视图收到触摸事件")
+                        }
+                    }
+                    // 9.8.0 的简介控件在 setter 触发时尚未挂载/布局（日志显示 attached=false、
+                    // 遍历只有 1 个 View），真正的文字控件是之后才添加的子 View。
+                    // 因此在挂载与每次布局时重新递归安装监听，覆盖后来加入的子 View。
+                    clazz.hookAfterMethod("onAttachedToWindow") { param ->
+                        (param.thisObject as? View)?.let { installDescLongClick(it) }
+                    }
+                    clazz.hookAfterMethod(
+                        "onLayout",
+                        Boolean::class.javaPrimitiveType,
+                        Int::class.javaPrimitiveType,
+                        Int::class.javaPrimitiveType,
+                        Int::class.javaPrimitiveType,
+                        Int::class.javaPrimitiveType
+                    ) { param ->
+                        (param.thisObject as? View)?.let { installDescLongClick(it) }
                     }
                     val longClickHooker: Hooker = hooker@{ param ->
                         val view = param.thisObject as? View ?: return@hooker
@@ -115,7 +237,12 @@ class CopyHook(classLoader: ClassLoader) : BaseHook(classLoader) {
                 }
         }
 
-        instance.dynamicDescHolderListeners().forEach { c ->
+        val dynamicHolders = instance.dynamicDescHolderListeners()
+        Log.d(
+            "CopyHook: dynamicDesc holders=${dynamicHolders.size}：" +
+                    dynamicHolders.joinToString { it?.name ?: "null" }
+        )
+        dynamicHolders.forEach { c ->
             c?.replaceMethod("onLongClick", View::class.java) { param ->
                 if (!enhanceLongClickCopy)
                     return@replaceMethod true
@@ -173,27 +300,36 @@ class CopyHook(classLoader: ClassLoader) : BaseHook(classLoader) {
         // 9.8.0+: 评论内容渲染改为 Compose/新 holder，内容视图为 RichTextView，
         // 原 CommentContentRichTextHandler 已不存在，长按复制增强直接挂载在 setText 上
         if (enhanceLongClickCopy) {
-            "com.bilibili.app.comment3.ui.widget.RichTextView".findClassOrNull(mClassLoader)
-                ?.hookAfterMethod(
-                    "setText",
-                    CharSequence::class.java,
-                    TextView.BufferType::class.java
+            // 9.8.0 的评论/动态评论存在多个渲染控件，逐个挂载以覆盖不同页面的评论
+            listOf(
+                "com.bilibili.app.comment3.ui.widget.RichTextView",
+                "com.bilibili.app.comment3.ui.nextwidget.NextExpandableTextView",
+                "com.bilibili.app.comment3.ui.nextwidget.NextExperiment3ExpandableTextView",
+                "com.bilibili.app.comment3.ui.widget.ExpandableTextView",
+                "com.bilibili.app.comm.comment2.widget.CommentExpandableTextView",
+                "com.bilibili.app.comment3.ui.widget.imagecardviewer.ui.widget.CardExpandableTextView"
+            ).forEach { className ->
+                val commentViewClass = className.findClassOrNull(mClassLoader) ?: return@forEach
+                Log.d("CopyHook: 评论长按 hook 已挂载 ${commentViewClass.name}")
+                commentViewClass.hookAfterMethod(
+                    "setText", CharSequence::class.java, TextView.BufferType::class.java
                 ) { param ->
                     val view = param.thisObject as? View ?: return@hookAfterMethod
-                    // M6 诊断：首次安装监听时，若 App 已自行注册长按监听，说明模块会覆盖它。
-                    // 之后的 setText 中该监听已属于模块自己，不再重复记录。
+                    // 首次安装监听时，若 App 已自行注册长按监听，说明模块会覆盖它
                     if (longClickViews.add(view) && view.hasOnLongClickListeners()) {
-                        Log.d("CopyHook: RichTextView 已有长按监听，将被模块覆盖 class=${view.javaClass.name}")
+                        Log.d("CopyHook: 评论控件已有长按监听，将被模块覆盖 class=${view.javaClass.name}")
                     }
-                    view.setOnLongClickListener { v ->
-                        Log.d("CopyHook: RichTextView longClick class=${v.javaClass.name} textLen=${(v as? TextView)?.text?.length ?: -1}")
-                        (v as? TextView)?.text?.let { text ->
-                            showLongPressCopyDialog(v.context, text)
-                        }
+                    installLongClickDeep(view, { pressed ->
+                        val tv = pressed as? TextView
+                        Log.d(
+                            "CopyHook: 评论长按 class=${pressed.javaClass.name} " +
+                                    "textLen=${tv?.text?.length ?: -1}"
+                        )
+                        tv?.text?.let { text -> showLongPressCopyDialog(pressed.context, text) }
                         true
-                    }
+                    }, "评论")
                 }
-
+            }
         }
 
         if (!enhanceLongClickCopy) return
@@ -262,6 +398,106 @@ class CopyHook(classLoader: ClassLoader) : BaseHook(classLoader) {
         }?.takeIf { !it.isNullOrEmpty() }
     }
 
+    /**
+     * Activity 层长按兜底。
+     *
+     * 9.8.0 的简介控件只在带 span 的小区域回调 `performLongClick(x, y)`，正文空白处
+     * 完全不回调；同时它的继承方法（onTouchEvent/onAttachedToWindow 等）无法用
+     * findAndHookMethod 挂载。因此只能在 Activity.dispatchTouchEvent 里识别长按，
+     * 再按坐标命中当时真正承载文本的视图（优先取捕获到的简介全文）。
+     */
+    private fun installDetailLongPressFallback() {
+        runCatching {
+            Activity::class.java.hookBeforeMethod(
+                "dispatchTouchEvent", MotionEvent::class.java
+            ) { param ->
+                val activity = param.thisObject as? Activity ?: return@hookBeforeMethod
+                val event = param.args[0] as? MotionEvent ?: return@hookBeforeMethod
+                when (event.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        pressDownAt = SystemClock.uptimeMillis()
+                        pressDownX = event.rawX
+                        pressDownY = event.rawY
+                    }
+
+                    MotionEvent.ACTION_MOVE -> {
+                        if (pressDownAt > 0L &&
+                            (Math.abs(event.rawX - pressDownX) > LONG_PRESS_SLOP ||
+                                Math.abs(event.rawY - pressDownY) > LONG_PRESS_SLOP)
+                        ) {
+                            pressDownAt = 0L
+                        }
+                    }
+
+                    MotionEvent.ACTION_UP -> {
+                        val downAt = pressDownAt
+                        pressDownAt = 0L
+                        if (downAt <= 0L) return@hookBeforeMethod
+                        if (SystemClock.uptimeMillis() - downAt < LONG_PRESS_MS) {
+                            return@hookBeforeMethod
+                        }
+                        // 只在详情类页面启用，避免影响首页/播放器等处的长按。
+                        // 9.8.0 的动态/opus 页类名不一定含 detail，这里放宽为一组关键字。
+                        val pageName = activity.javaClass.name
+                        val isTargetPage = TARGET_PAGE_KEYWORDS.any { pageName.contains(it, true) }
+                        if (!isTargetPage) {
+                            if (loggedSkipPages.size < 30 && loggedSkipPages.add(pageName)) {
+                                Log.d("CopyHook: 长按兜底跳过 class=$pageName（非目标页面）")
+                            }
+                            return@hookBeforeMethod
+                        }
+                        val text = runCatchingOrNull {
+                            findTextAtPoint(
+                                activity.window?.decorView, event.rawX, event.rawY
+                            )
+                        }
+                        if (text.isNullOrEmpty() || text.length < 5) {
+                            Log.d(
+                                "CopyHook: 长按兜底未取到文本 class=$pageName " +
+                                        "textLen=${text?.length ?: -1}"
+                            )
+                            return@hookBeforeMethod
+                        }
+                        Log.d(
+                            "CopyHook: 长按兜底命中 class=$pageName textLen=${text.length}"
+                        )
+                        showLongPressCopyDialog(activity, text)
+                        // 吞掉事件，避免 App 自己也弹一次菜单
+                        param.result = true
+                    }
+                }
+            }
+            Log.d("CopyHook: 长按兜底已安装（Activity.dispatchTouchEvent）")
+        }.onFailure { Log.e("CopyHook: 长按兜底安装失败: $it") }
+    }
+
+    /** 在 [root] 中按屏幕坐标找到最深处的文本视图，优先返回简介全文缓存。 */
+    private fun findTextAtPoint(root: View?, x: Float, y: Float): CharSequence? {
+        if (root == null) return null
+        val hits = ArrayList<View>()
+        val location = IntArray(2)
+
+        fun walk(v: View) {
+            if (!v.isShown) return
+            v.getLocationOnScreen(location)
+            val vx = location[0]
+            val vy = location[1]
+            if (x < vx || y < vy || x >= vx + v.width || y >= vy + v.height) return
+            hits.add(v)
+            if (v is ViewGroup) {
+                for (i in v.childCount - 1 downTo 0) walk(v.getChildAt(i))
+            }
+        }
+
+        walk(root)
+        // 由深到浅：先看有没有捕获到的简介全文，再看普通 TextView 文本
+        for (v in hits.asReversed()) {
+            descFullText[v]?.takeIf { it.isNotEmpty() }?.let { return it }
+            (v as? TextView)?.text?.takeIf { it.isNotEmpty() }?.let { return it }
+        }
+        return null
+    }
+
     private fun showLongPressCopyDialog(context: Context, text: CharSequence) {
         val appDialogTheme = getResId("AppTheme.Dialog.Alert", "style")
         AlertDialog.Builder(context, appDialogTheme).run {
@@ -287,6 +523,34 @@ class CopyHook(classLoader: ClassLoader) : BaseHook(classLoader) {
             show()
         }.apply {
             findViewById<TextView>(android.R.id.message)?.setTextIsSelectable(true)
+        }
+    }
+
+    /**
+     * 递归给 [root] 及其所有子 View 安装长按监听。
+     *
+     * 9.8.0 的简介/评论文字常由子 View 绘制并消费触摸，只给容器装监听会出现
+     * "只有容器空白处（左侧一小块区域）能触发长按"的问题。
+     */
+    private fun installLongClickDeep(root: View, onLongClick: (View) -> Boolean, tag: String) {
+        val stack = ArrayDeque<View>()
+        stack.add(root)
+        var visited = 0
+        var added = 0
+        while (stack.isNotEmpty() && visited < 200) {
+            val v = stack.removeFirst()
+            visited++
+            if (v is ViewGroup) {
+                for (i in 0 until v.childCount) stack.add(v.getChildAt(i))
+            }
+            if (!deepLongClickViews.add(v)) continue
+            v.isLongClickable = true
+            v.setOnLongClickListener { pressed -> onLongClick(pressed) }
+            added++
+        }
+        // 只在真正新增了监听时记录，避免每次 setter/layout 都刷屏
+        if (added > 0) {
+            Log.d("CopyHook: $tag 深度长按监听 root=${root.javaClass.name} 新增=$added 遍历=$visited")
         }
     }
 

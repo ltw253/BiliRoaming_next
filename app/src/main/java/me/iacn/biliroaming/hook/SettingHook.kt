@@ -121,7 +121,10 @@ class SettingHook(classLoader: ClassLoader) : BaseHook(classLoader) {
         dataField.isAccessible = true
 
         fun injectSettingItem(data: MutableList<*>) {
-            if (data.isEmpty()) return
+            if (data.isEmpty()) {
+                Log.d("SettingHook: 适配器数据为空，跳过注入")
+                return
+            }
 
             // 去重：检查 data 中所有 MenuGroup 的 itemList 是否已含设置项
             for (group in data) {
@@ -137,10 +140,18 @@ class SettingHook(classLoader: ClassLoader) : BaseHook(classLoader) {
             }
 
             val targetList = data.lastOrNull()
-                ?.getObjectFieldOrNullAs<MutableList<Any>>("itemList") ?: return
+                ?.getObjectFieldOrNullAs<MutableList<Any>>("itemList")
+                ?: run {
+                    Log.d("SettingHook: 最后一组没有 itemList，跳过注入（data=${data.size}）")
+                    return
+                }
 
-            val item = makeSettingItem() ?: return
+            val item = makeSettingItem() ?: run {
+                Log.d("SettingHook: makeSettingItem 返回 null，跳过注入")
+                return
+            }
             targetList.add(if(targetList.isEmpty()) 0 else targetList.lastIndex, item)
+            Log.d("SettingHook: 已注入设置项（组数=${data.size}，项数=${targetList.size}）")
         }
 
         // hook RecyclerView.Adapter 多个通知方法代替单一 notifyDataSetChanged
@@ -157,6 +168,23 @@ class SettingHook(classLoader: ClassLoader) : BaseHook(classLoader) {
                     injectSettingItem(data)
                 }
             }
+        }
+
+        // 兜底 2：部分版本会直接整体替换 data 列表（不走 notify），或者 notify 时数据仍为空
+        // 导致上面的注入被跳过。这里再 hook 适配器上所有"单个 List 参数"的方法，数据一到就注入。
+        adapterClass.declaredMethods.filter { m ->
+            !java.lang.reflect.Modifier.isStatic(m.modifiers) &&
+                m.parameterTypes.size == 1 &&
+                List::class.java.isAssignableFrom(m.parameterTypes[0])
+        }.forEach { method ->
+            runCatching {
+                method.hookAfterMethod { param ->
+                    if (!adapterClass.isInstance(param.thisObject)) return@hookAfterMethod
+                    @Suppress("UNCHECKED_CAST")
+                    val list = param.args[0] as? MutableList<Any> ?: return@hookAfterMethod
+                    injectSettingItem(list)
+                }
+            }.onFailure { Log.d("SettingHook: 列表注入 hook 安装失败 ${method.name}: $it") }
         }
 
         // 为注入的设置项绑定点击监听

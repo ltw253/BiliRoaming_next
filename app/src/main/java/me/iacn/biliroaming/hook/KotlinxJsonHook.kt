@@ -8,6 +8,7 @@ import me.iacn.biliroaming.utils.Log
 import me.iacn.biliroaming.utils.callMethodOrNull
 import me.iacn.biliroaming.utils.getObjectFieldAs
 import me.iacn.biliroaming.utils.hookAfterAllMethods
+import me.iacn.biliroaming.utils.runCatchingOrNull
 
 class KotlinxJsonHook(classLoader: ClassLoader) : BaseHook(classLoader) {
     private val allProcessors = listOf(
@@ -35,10 +36,17 @@ class KotlinxJsonHook(classLoader: ClassLoader) : BaseHook(classLoader) {
     private fun dispatchResult(deserializer: Any?, result: Any?) {
         if (deserializer == null || result == null) return
 
-        val serialName = deserializer
-            .callMethodOrNull("getDescriptor")
-            ?.getObjectFieldAs<String>("serialName")
+        val descriptor = runCatchingOrNull { deserializer.callMethodOrNull("getDescriptor") }
             ?: return
+        // 旧写法直接取描述符的 "serialName" 字段，但 ArrayListClassDesc 这类描述符
+        // 只在 SerialDescriptor 接口上提供 getSerialName() 方法、没有该字段，
+        // 会抛 NoSuchFieldError（见用户日志 kotlinx.serialization.internal.ArrayListClassDesc#serialName）。
+        // 这里优先调用接口方法，失败再回退字段读取。
+        val serialName = runCatchingOrNull {
+            (descriptor.callMethodOrNull("getSerialName") as? String)?.takeIf { it.isNotEmpty() }
+        } ?: runCatchingOrNull {
+            descriptor.getObjectFieldAs<String>("serialName")
+        } ?: return
 
         enabledProcessors[serialName]?.forEach { processor ->
             try {
