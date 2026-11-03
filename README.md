@@ -35,9 +35,7 @@
 
 ## 反馈与问题
 
-遇到 bug 或有功能建议，欢迎发送邮件至：**ok20090503@gmail.com**
-
-> 也可以在本仓库的 Issues 中反馈。提交问题时请尽量附上：客户端版本、模块版本、复现步骤，以及日志（`Android/data/tv.danmaku.bili/cache/log.txt`）。
+遇到 bug 或有功能建议，欢迎在本仓库的 Issues 中反馈。提交问题时请尽量附上：客户端版本、模块版本、复现步骤，以及日志（`Android/data/tv.danmaku.bili/cache/log.txt`）。
 
 ## 致谢
 
