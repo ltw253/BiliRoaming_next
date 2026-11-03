@@ -42,7 +42,7 @@ class CopyHook(classLoader: ClassLoader) : BaseHook(classLoader) {
          * 非目标页面只记录一次日志，便于后续定位新页面。
          */
         private val TARGET_PAGE_KEYWORDS = arrayOf(
-            "detail", "opus", "dynamic", "followinglist", "intro", "bangumi"
+            "detail", "opus", "dynamic", "followinglist", "intro", "bangumi", "vertex"
         )
     }
 
@@ -75,6 +75,10 @@ class CopyHook(classLoader: ClassLoader) : BaseHook(classLoader) {
 
     // 长按兜底"跳过"过的页面类名（只记一次，避免刷屏）
     private val loggedSkipPages =
+        java.util.Collections.synchronizedSet(java.util.LinkedHashSet<String>())
+
+    // 长按兜底"取不到文本"过的页面类名（只记一次，用于定位 Compose 页面）
+    private val loggedEmptyTextPages =
         java.util.Collections.synchronizedSet(java.util.LinkedHashSet<String>())
 
     override fun startHook() {
@@ -452,10 +456,45 @@ class CopyHook(classLoader: ClassLoader) : BaseHook(classLoader) {
                             )
                         }
                         if (text.isNullOrEmpty() || text.length < 5) {
+                            val hits = runCatchingOrNull {
+                                viewsAtPoint(
+                                    activity.window?.decorView, event.rawX, event.rawY
+                                )
+                            }.orEmpty()
+                            // 动态等页面是纯 Compose 渲染（View 树到 AndroidComposeView 就到底），
+                            // 改从 Compose 语义树按坐标取文本
+                            val composeView = hits.lastOrNull {
+                                it.javaClass.name.contains("AndroidComposeView", true)
+                            }
+                            val composeText = runCatchingOrNull {
+                                composeView?.let { cv ->
+                                    composeTextAt(cv, event.rawX, event.rawY)
+                                }
+                            }
                             Log.d(
-                                "CopyHook: 长按兜底未取到文本 class=$pageName " +
-                                        "textLen=${text?.length ?: -1}"
+                                "CopyHook: Compose 提取 class=$pageName " +
+                                        "textLen=${composeText?.length ?: -1}"
                             )
+                            if (!composeText.isNullOrEmpty() && composeText.length >= 3) {
+                                Log.d(
+                                    "CopyHook: 长按兜底命中(Compose) class=$pageName " +
+                                            "textLen=${composeText.length}"
+                                )
+                                showLongPressCopyDialog(activity, composeText)
+                                param.result = true
+                                return@hookBeforeMethod
+                            }
+                            if (loggedEmptyTextPages.size < 30 &&
+                                loggedEmptyTextPages.add(pageName)
+                            ) {
+                                Log.d(
+                                    "CopyHook: 长按兜底未取到文本 class=$pageName " +
+                                            "textLen=${text?.length ?: -1} hits=" +
+                                            hits.takeLast(8).joinToString(",") {
+                                                it.javaClass.simpleName
+                                            }
+                                )
+                            }
                             return@hookBeforeMethod
                         }
                         Log.d(
@@ -471,9 +510,235 @@ class CopyHook(classLoader: ClassLoader) : BaseHook(classLoader) {
         }.onFailure { Log.e("CopyHook: 长按兜底安装失败: $it") }
     }
 
-    /** 在 [root] 中按屏幕坐标找到最深处的文本视图，优先返回简介全文缓存。 */
-    private fun findTextAtPoint(root: View?, x: Float, y: Float): CharSequence? {
-        if (root == null) return null
+
+    /** 从语义节点尽量取出文本（类名被混淆，用启发式：有 iterator() 的对象视作 config）。 */
+    private fun extractComposeText(node: Any): String? {
+        val config = node.javaClass.declaredMethods.asSequence()
+            .filter { it.parameterTypes.isEmpty() && !it.returnType.isPrimitive }
+            .firstNotNullOfOrNull { m ->
+                runCatchingOrNull {
+                    m.apply { isAccessible = true }.invoke(node)?.takeIf { v ->
+                        v.javaClass.declaredMethods.any { it.name == "iterator" }
+                    }
+                }
+            } ?: return null
+        val iterator = runCatchingOrNull {
+            config.javaClass.declaredMethods.firstOrNull { it.name == "iterator" }
+                ?.apply { isAccessible = true }?.invoke(config) as? java.util.Iterator<*>
+        } ?: return null
+        val parts = ArrayList<String>()
+        var guard = 0
+        while (iterator.hasNext() && guard++ < 64) {
+            val entry = iterator.next() ?: continue
+            val value = runCatchingOrNull {
+                entry.javaClass.declaredMethods.firstOrNull { it.name == "getValue" }
+                    ?.apply { isAccessible = true }?.invoke(entry)
+            } ?: continue
+            anyToText(value)?.let { if (it.isNotEmpty()) parts.add(it) }
+        }
+        return parts.joinToString("").takeIf { it.isNotEmpty() }
+    }
+
+    /**
+     * 只把"文本型"值转成字符串（兼容 AnnotatedString，取 getText()）。
+     *
+     * 不再对任意对象调 toString()：否则 RectangleShape、true 这类值会被误当成文本，
+     * 用户会看到弹框里显示 "RectangleShape" 而不是动态正文。
+     */
+    private fun anyToText(value: Any?): String? {
+        if (value == null) return null
+        if (value is CharSequence) return value.toString()
+        if (value is List<*>) {
+            val s = value.mapNotNull { anyToText(it) }.joinToString("")
+            return s.takeIf { it.isNotEmpty() }
+        }
+        val textGetter = value.javaClass.methods.firstOrNull { m ->
+            m.parameterTypes.isEmpty() && m.returnType == String::class.java &&
+                m.name.equals("getText", true)
+        }
+        return runCatchingOrNull {
+            textGetter?.apply { isAccessible = true }?.invoke(value) as? String
+        }
+    }
+
+    /** `SemanticsProperties.Text` 的键（若该版本保留了该类名，用于精确匹配文本属性）。 */
+    private val composeTextKey: Any? by lazy {
+        runCatchingOrNull {
+            "androidx.compose.ui.semantics.SemanticsProperties".findClassOrNull(mClassLoader)
+                ?.let { cls ->
+                    runCatchingOrNull { cls.getStaticObjectField("Text") }
+                        ?: runCatchingOrNull {
+                            cls.getStaticObjectField("INSTANCE")
+                                ?.callMethodOrNull("getText")
+                        }
+                }
+        }
+    }
+
+    /**
+     * 值是否是文本型属性。
+     *
+     * Compose 里 Text / EditableText / ContentDescription 的值都是 `List<AnnotatedString>`；
+     * Shape、Boolean、Role 等值不是 List，直接排除。
+     */
+    private fun isTextValue(value: Any?): Boolean {
+        if (value !is List<*> || value.isEmpty()) return false
+        return value.all { item ->
+            if (item == null) return@all true
+            val cls = item.javaClass
+            cls.name.contains("AnnotatedString", true) ||
+                cls.methods.any { m ->
+                    m.parameterTypes.isEmpty() && m.returnType == String::class.java &&
+                        m.name.equals("getText", true)
+                }
+        }
+    }
+
+    /**
+     * 从 Compose 语义树按屏幕坐标取文本。
+     *
+     * 实测 9.8.0 的 Compose 语义树 API 被 R8 混淆/内联，只能按签名特征定位：
+     *  - 取子节点：`(boolean,boolean,boolean)->List`
+     *  - 取边界：`()->Rect`
+     *  - 取配置：`()->` 带 `iterator()` 的对象
+     * 递归遍历，优先返回"边界包含点击点且面积最小"的节点文本，否则返回最长文本。
+     */
+    private fun composeTextAt(composeView: View, screenX: Float, screenY: Float): String? {
+        val owner = runCatchingOrNull {
+            composeView.javaClass.declaredMethods.firstOrNull {
+                it.parameterTypes.isEmpty() && it.name.contains("semantic", true)
+            }?.apply { isAccessible = true }?.invoke(composeView)
+        } ?: run {
+            Log.d("CopyHook: Compose 提取失败：semanticsOwner=null")
+            return null
+        }
+        val rootNode = runCatchingOrNull {
+            owner.javaClass.declaredMethods.firstOrNull { it.parameterTypes.isEmpty() }
+                ?.apply { isAccessible = true }?.invoke(owner)
+        } ?: run {
+            Log.d("CopyHook: Compose 提取失败：rootNode=null")
+            return null
+        }
+        val nodeClass = rootNode.javaClass
+        val childrenMethod = nodeClass.methods.firstOrNull { m ->
+            java.util.List::class.java.isAssignableFrom(m.returnType) &&
+                m.parameterTypes.size == 3 &&
+                m.parameterTypes.all { it == java.lang.Boolean.TYPE }
+        }
+        val rectMethod = nodeClass.methods.firstOrNull {
+            it.parameterTypes.isEmpty() && it.returnType.simpleName == "Rect"
+        }
+        if (childrenMethod == null || rectMethod == null) {
+            Log.d(
+                "CopyHook: Compose 提取失败：children=$childrenMethod rect=$rectMethod"
+            )
+            return null
+        }
+        val location = IntArray(2)
+        composeView.getLocationOnScreen(location)
+        val px = screenX - location[0]
+        val py = screenY - location[1]
+
+        var bestInPoint: String? = null
+        var bestInPointArea = Double.MAX_VALUE
+        var bestAny: String? = null
+        var visited = 0
+        val numberRegex = Regex("[-\\d.]+")
+
+        fun visit(node: Any?, depth: Int) {
+            if (node == null || depth > 40 || visited > 3000) return
+            visited++
+            val text = semanticTextOf(node)
+            if (!text.isNullOrEmpty()) {
+                val rectText = runCatchingOrNull {
+                    rectMethod.apply { isAccessible = true }.invoke(node)?.toString()
+                }
+                val nums = rectText?.let { raw ->
+                    numberRegex.findAll(raw).mapNotNull { it.value.toFloatOrNull() }.toList()
+                }
+                if (nums != null && nums.size >= 4) {
+                    val left = nums[0]
+                    val top = nums[1]
+                    val right = nums[2]
+                    val bottom = nums[3]
+                    if (px >= left && px <= right && py >= top && py <= bottom) {
+                        val area = ((right - left) * (bottom - top)).toDouble()
+                        if (bestInPoint == null || area < bestInPointArea) {
+                            bestInPoint = text
+                            bestInPointArea = area
+                        }
+                    }
+                }
+                val currentBest = bestAny
+                if (currentBest == null || text.length > currentBest.length) {
+                    bestAny = text
+                }
+            }
+            val children = runCatchingOrNull {
+                childrenMethod.apply { isAccessible = true }
+                    .invoke(node, false, false, false) as? List<*>
+            }.orEmpty()
+            children.forEach { visit(it, depth + 1) }
+        }
+
+        visit(rootNode, 0)
+        Log.d(
+            "CopyHook: Compose 遍历 visited=$visited " +
+                    "命中点=${bestInPoint?.length ?: -1} 最长=${bestAny?.length ?: -1}"
+        )
+        return bestInPoint ?: bestAny
+    }
+
+    /** 读取语义节点配置里的文本（取最长的一段，兼容 AnnotatedString）。 */
+    private fun semanticTextOf(node: Any): String? {
+        val config = runCatchingOrNull {
+            node.javaClass.methods.firstOrNull { m ->
+                if (m.parameterTypes.isNotEmpty() || m.returnType.isPrimitive) {
+                    return@firstOrNull false
+                }
+                if (m.declaringClass == Any::class.java) return@firstOrNull false
+                runCatchingOrNull {
+                    m.apply { isAccessible = true }.invoke(node)?.javaClass
+                        ?.methods?.any { it.name == "iterator" }
+                } == true
+            }?.apply { isAccessible = true }?.invoke(node)
+        } ?: return null
+        val iterator = runCatchingOrNull {
+            config.javaClass.methods
+                .firstOrNull { it.name == "iterator" && it.parameterTypes.isEmpty() }
+                ?.invoke(config) as? java.util.Iterator<*>
+        } ?: return null
+        var best: String? = null
+        var count = 0
+        val expectedKey = composeTextKey
+        while (iterator.hasNext() && count++ < 40) {
+            val entry = iterator.next() ?: continue
+            val key = runCatchingOrNull {
+                entry.javaClass.declaredMethods.firstOrNull { it.name == "getKey" }
+                    ?.apply { isAccessible = true }?.invoke(entry)
+            }
+            val value = runCatchingOrNull {
+                entry.javaClass.declaredMethods.firstOrNull { it.name == "getValue" }
+                    ?.apply { isAccessible = true }?.invoke(entry)
+            } ?: continue
+            // 优先按 SemanticsProperties.Text 的键精确匹配；拿不到键时退回"值形态"判断，
+            // 两者都不满足则跳过（避免把 RectangleShape / true 当成正文）
+            val matchedByKey = expectedKey != null && key != null && key == expectedKey
+            if (!matchedByKey && !isTextValue(value)) continue
+            val text = anyToText(value)
+            if (!text.isNullOrBlank()) {
+                val current = best
+                if (current == null || text.length > current.length) {
+                    best = text
+                }
+            }
+        }
+        return best
+    }
+
+    /** 按屏幕坐标收集命中的视图链（由浅到深）。 */
+    private fun viewsAtPoint(root: View?, x: Float, y: Float): List<View> {
+        if (root == null) return emptyList()
         val hits = ArrayList<View>()
         val location = IntArray(2)
 
@@ -490,8 +755,13 @@ class CopyHook(classLoader: ClassLoader) : BaseHook(classLoader) {
         }
 
         walk(root)
+        return hits
+    }
+
+    /** 在 [root] 中按屏幕坐标找到最深处的文本视图，优先返回简介全文缓存。 */
+    private fun findTextAtPoint(root: View?, x: Float, y: Float): CharSequence? {
         // 由深到浅：先看有没有捕获到的简介全文，再看普通 TextView 文本
-        for (v in hits.asReversed()) {
+        for (v in viewsAtPoint(root, x, y).asReversed()) {
             descFullText[v]?.takeIf { it.isNotEmpty() }?.let { return it }
             (v as? TextView)?.text?.takeIf { it.isNotEmpty() }?.let { return it }
         }
